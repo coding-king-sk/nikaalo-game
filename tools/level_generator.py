@@ -1,204 +1,351 @@
 #!/usr/bin/env python3
 """Nikaalo level generator.
 
-Randomly places vehicles on a grid, solves each board with BFS, and keeps only
-the boards whose optimal solution length falls inside the requested difficulty
-window. Pure standard library -- no dependencies.
+Every board is verified with a bitmask breadth-first search, so the exported
+`minMoves` is the true optimal solution length - never an estimate. The app
+uses the same algorithm at runtime to produce hints.
+
+Pure random placement almost never produces a 15+ move board, so the miner
+uses hill climbing: mutate one blocker at a time and keep boards whose BFS
+solution length does not get shorter.
 
 Usage:
-    python3 tools/level_generator.py --count 60 --min-moves 6 --max-moves 14 \\
-        --grid 6 --out app/src/main/assets/levels.json
-"""
+    # mine a pool of verified boards for 10 minutes
+    python3 tools/level_generator.py mine --seconds 600 --out pool.json
 
+    # lay a pool out into chapters and write the app asset
+    python3 tools/level_generator.py curate --pool pool.json \\
+        --out app/src/main/assets/levels.txt
+"""
 from __future__ import annotations
 
 import argparse
 import json
 import random
-from collections import deque
+import time
+from collections import Counter, deque
 
-BLOCKER_TYPES_2 = ["car", "bike", "thela"]
-BLOCKER_TYPES_3 = ["bus", "truck"]
+BLOCK2 = ["car", "bike", "thela"]
+BLOCK3 = ["bus", "truck"]
 
+CODE = {
+    "auto": "a",
+    "bike": "k",
+    "car": "c",
+    "thela": "t",
+    "bus": "b",
+    "truck": "T",
+    "cow": "w",
+}
 
-def cells(vehicle):
-    r, c, length, direction = vehicle["r"], vehicle["c"], vehicle["len"], vehicle["dir"]
-    if direction == "h":
-        return [(r, c + i) for i in range(length)]
-    return [(r + i, c) for i in range(length)]
+# name, count, min moves, max moves, prefer boards containing a cow
+CHAPTERS = [
+    ("Gali Mohalla", 15, 3, 6, False),
+    ("Sabzi Mandi", 25, 7, 11, False),
+    ("Bus Stand", 25, 12, 13, False),
+    ("Highway Toll", 20, 14, 15, False),
+    ("Gaay Chowk", 20, 16, 18, True),
+    ("Rush Hour Mumbai", 15, 19, 45, False),
+]
 
-
-def build_grid(vehicles, size):
-    grid = [[-1] * size for _ in range(size)]
-    for index, vehicle in enumerate(vehicles):
-        for r, c in cells(vehicle):
-            if not (0 <= r < size and 0 <= c < size) or grid[r][c] != -1:
-                return None
-            grid[r][c] = index
-    return grid
-
-
-def state_of(vehicles):
-    return tuple((v["r"], v["c"]) for v in vehicles)
-
-
-def apply_state(vehicles, state):
-    return [dict(v, r=pos[0], c=pos[1]) for v, pos in zip(vehicles, state)]
-
-
-def is_solved(vehicles, size):
-    auto = vehicles[0]
-    return auto["c"] + auto["len"] >= size
-
-
-def neighbours(vehicles, size):
-    grid = build_grid(vehicles, size)
-    if grid is None:
-        return
-    for index, vehicle in enumerate(vehicles):
-        if vehicle["type"] == "cow":
-            continue
-        horizontal = vehicle["dir"] == "h"
-        # backward (left / up)
-        step = 1
-        while True:
-            r = vehicle["r"] if horizontal else vehicle["r"] - step
-            c = vehicle["c"] - step if horizontal else vehicle["c"]
-            if r < 0 or c < 0 or grid[r][c] != -1:
-                break
-            moved = list(vehicles)
-            moved[index] = dict(vehicle, r=r, c=c)
-            yield state_of(moved)
-            step += 1
-        # forward (right / down)
-        step = 1
-        while True:
-            tail_r = vehicle["r"] + (0 if horizontal else vehicle["len"] - 1) + (0 if horizontal else step)
-            tail_c = vehicle["c"] + (vehicle["len"] - 1 + step if horizontal else 0)
-            if tail_r >= size or tail_c >= size or grid[tail_r][tail_c] != -1:
-                break
-            moved = list(vehicles)
-            moved[index] = dict(
-                vehicle,
-                r=vehicle["r"] if horizontal else vehicle["r"] + step,
-                c=vehicle["c"] + step if horizontal else vehicle["c"],
-            )
-            yield state_of(moved)
-            step += 1
+# grid, blockers, cow chance
+CONFIGS = [
+    (6, 6, 0.00),
+    (6, 9, 0.00),
+    (6, 11, 0.00),
+    (6, 12, 0.00),
+    (7, 12, 0.00),
+    (7, 13, 0.12),
+    (7, 14, 0.10),
+]
 
 
-def min_moves(vehicles, size, max_states=200_000):
-    """BFS: the first solution found is always the shortest one."""
-    start = state_of(vehicles)
-    if is_solved(vehicles, size):
+# ---------------------------------------------------------------- solver
+
+def build_masks(size, specs):
+    """Per-vehicle, per-position cell bitmasks over a size*size bitboard."""
+    masks = []
+    for v in specs:
+        ln = v["len"]
+        horizontal = v["dir"] == "h"
+        row = []
+        for p in range(size - ln + 1):
+            m = 0
+            for k in range(ln):
+                if horizontal:
+                    m |= 1 << (v["r"] * size + p + k)
+                else:
+                    m |= 1 << ((p + k) * size + v["c"])
+            row.append(m)
+        masks.append(row)
+    start = tuple(v["c"] if v["dir"] == "h" else v["r"] for v in specs)
+    return masks, start
+
+
+def min_moves(size, specs, cap=160_000):
+    """Optimal solution length, or None if unsolvable within the state cap.
+
+    BFS explores by depth, so the first solution reached is always shortest.
+    """
+    masks, start = build_masks(size, specs)
+
+    board = 0
+    for i, p in enumerate(start):
+        if board & masks[i][p]:
+            return None  # overlapping pieces
+        board |= masks[i][p]
+
+    n = len(specs)
+    lens = [v["len"] for v in specs]
+    movable = [v["type"] != "cow" for v in specs]
+    maxpos = [size - lens[i] for i in range(n)]
+    player_len = lens[0]
+    if start[0] + player_len >= size:
         return 0
+
     seen = {start}
     queue = deque([(start, 0)])
     expanded = 0
-    while queue and expanded < max_states:
-        state, depth = queue.popleft()
+
+    while queue and expanded < cap:
+        pos, depth = queue.popleft()
         expanded += 1
-        current = apply_state(vehicles, state)
-        for nxt in neighbours(current, size):
-            if nxt in seen:
+
+        board = 0
+        for i in range(n):
+            board |= masks[i][pos[i]]
+
+        for i in range(n):
+            if not movable[i]:
                 continue
-            seen.add(nxt)
-            candidate = apply_state(vehicles, nxt)
-            if is_solved(candidate, size):
-                return depth + 1
-            queue.append((nxt, depth + 1))
+            others = board ^ masks[i][pos[i]]
+            mi = masks[i]
+            for step in (-1, 1):
+                p = pos[i]
+                while True:
+                    p += step
+                    if p < 0 or p > maxpos[i]:
+                        break
+                    if mi[p] & others:
+                        break  # blocked, and everything beyond is unreachable
+                    nxt = pos[:i] + (p,) + pos[i + 1:]
+                    if nxt in seen:
+                        continue
+                    seen.add(nxt)
+                    if i == 0 and p + player_len >= size:
+                        return depth + 1
+                    queue.append((nxt, depth + 1))
+    return None
+
+
+# ------------------------------------------------------------- generation
+
+def cells_of(v):
+    return set(
+        (v["r"] + (k if v["dir"] == "v" else 0), v["c"] + (k if v["dir"] == "h" else 0))
+        for k in range(v["len"])
+    )
+
+
+def random_piece(size, auto_row, occupied, cow_chance, rng):
+    for _ in range(40):
+        roll = rng.random()
+        if roll < cow_chance:
+            kind, ln, d = "cow", 1, "h"
+        elif roll < cow_chance + 0.36:
+            kind, ln, d = rng.choice(BLOCK3), 3, rng.choice(["h", "v"])
+        else:
+            kind, ln, d = rng.choice(BLOCK2), 2, rng.choice(["h", "v"])
+
+        if d == "h":
+            r, c = rng.randrange(size), rng.randrange(size - ln + 1)
+        else:
+            r, c = rng.randrange(size - ln + 1), rng.randrange(size)
+
+        # A horizontal piece or a cow in the auto's lane can never be passed.
+        if r == auto_row and (d == "h" or kind == "cow"):
+            continue
+
+        cand = {"type": kind, "r": r, "c": c, "len": ln, "dir": d}
+        if cells_of(cand) & occupied:
+            continue
+        return cand
     return None
 
 
 def random_board(size, blockers, cow_chance, rng):
     auto_row = rng.randrange(size)
-    auto_col = rng.randrange(0, max(1, size - 3))
-    vehicles = [{"type": "auto", "r": auto_row, "c": auto_col, "len": 2, "dir": "h"}]
+    auto_col = rng.randrange(0, size - 2)
+    specs = [{"type": "auto", "r": auto_row, "c": auto_col, "len": 2, "dir": "h"}]
+    occupied = cells_of(specs[0])
+    while len(specs) - 1 < blockers:
+        piece = random_piece(size, auto_row, occupied, cow_chance, rng)
+        if piece is None:
+            break
+        occupied |= cells_of(piece)
+        specs.append(piece)
+    return specs
 
-    attempts = 0
-    while len(vehicles) - 1 < blockers and attempts < blockers * 40:
-        attempts += 1
-        if rng.random() < cow_chance:
-            kind, length, direction = "cow", 1, "h"
-        elif rng.random() < 0.3:
-            kind, length = rng.choice(BLOCKER_TYPES_3), 3
-            direction = rng.choice(["h", "v"])
-        else:
-            kind, length = rng.choice(BLOCKER_TYPES_2), 2
-            direction = rng.choice(["h", "v"])
 
-        if direction == "h":
-            r, c = rng.randrange(size), rng.randrange(size - length + 1)
-        else:
-            r, c = rng.randrange(size - length + 1), rng.randrange(size)
+def mutate(specs, size, cow_chance, rng):
+    """Reposition exactly one blocker."""
+    if len(specs) < 2:
+        return None
+    out = [dict(v) for v in specs]
+    index = rng.randrange(1, len(out))
+    occupied = set()
+    for i, v in enumerate(out):
+        if i != index:
+            occupied |= cells_of(v)
+    piece = random_piece(size, out[0]["r"], occupied, cow_chance, rng)
+    if piece is None:
+        return None
+    out[index] = piece
+    return out
 
-        candidate = {"type": kind, "r": r, "c": c, "len": length, "dir": direction}
-        # A horizontal blocker on the auto's row can never be passed.
-        if direction == "h" and r == auto_row:
+
+def signature(size, specs):
+    return (
+        size,
+        json.dumps(sorted((v["type"], v["r"], v["c"], v["len"], v["dir"]) for v in specs)),
+    )
+
+
+def mine(seconds, min_keep, seed, out_path):
+    rng = random.Random(seed)
+    started = time.time()
+    collected = {}
+    evaluated = 0
+    reported = 0.0
+
+    while time.time() - started < seconds:
+        size, blockers, cow = CONFIGS[rng.randrange(len(CONFIGS))]
+        current = random_board(size, blockers, cow, rng)
+        score = min_moves(size, current) or 0
+        evaluated += 1
+
+        for _ in range(120):
+            if time.time() - started > seconds:
+                break
+            candidate = mutate(current, size, cow, rng)
+            if candidate is None:
+                continue
+            value = min_moves(size, candidate)
+            evaluated += 1
+            if not value:
+                continue
+            if value >= min_keep:
+                collected.setdefault(signature(size, candidate), (value, candidate, size))
+            # Accept equal-or-better boards so the search can drift sideways.
+            if value >= score - 1:
+                current, score = candidate, value
+
+        now = time.time() - started
+        if now - reported > 45:
+            reported = now
+            best = max((v for v, _s, _g in collected.values()), default=0)
+            print(f"[{now:.0f}s] evaluated={evaluated} kept={len(collected)} max={best}", flush=True)
+
+    pool = [
+        {"grid": g, "minMoves": v, "vehicles": s}
+        for v, s, g in collected.values()
+    ]
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(pool, fh)
+    print(f"wrote {len(pool)} verified boards to {out_path}")
+
+
+# --------------------------------------------------------------- curation
+
+def has_cow(level):
+    return any(v["type"] == "cow" for v in level["vehicles"])
+
+
+def curate(pool_path, out_path, extra_pools):
+    raw = json.load(open(pool_path, encoding="utf-8"))
+    for extra in extra_pools or []:
+        raw += json.load(open(extra, encoding="utf-8"))
+
+    pool, seen = [], set()
+    for item in raw:
+        sig = signature(item["grid"], item["vehicles"])
+        if sig in seen:
             continue
-        if kind == "cow" and r == auto_row:
+        verified = min_moves(item["grid"], item["vehicles"], cap=250_000)
+        if not verified or verified < 2:
             continue
-        if build_grid(vehicles + [candidate], size) is None:
-            continue
-        vehicles.append(candidate)
-    return vehicles
+        seen.add(sig)
+        pool.append({"grid": item["grid"], "minMoves": verified, "vehicles": item["vehicles"]})
+
+    print("verified pool:", len(pool))
+    print("distribution:", sorted(Counter(p["minMoves"] for p in pool).items()))
+
+    used = set()
+
+    def take(count, lo, hi, prefer_cow):
+        """Pick `count` boards spread evenly across the whole move band."""
+        by_moves = {}
+        for p in pool:
+            if lo <= p["minMoves"] <= hi and id(p) not in used:
+                by_moves.setdefault(p["minMoves"], []).append(p)
+        for group in by_moves.values():
+            group.sort(key=lambda p: (not has_cow(p) if prefer_cow else has_cow(p), -len(p["vehicles"])))
+
+        picked, values = [], sorted(by_moves)
+        while len(picked) < count and any(by_moves[v] for v in values):
+            for value in values:
+                if len(picked) >= count:
+                    break
+                if by_moves[value]:
+                    p = by_moves[value].pop(0)
+                    used.add(id(p))
+                    picked.append(p)
+        picked.sort(key=lambda p: (p["minMoves"], len(p["vehicles"])))
+        return picked
+
+    lines = [
+        "# Nikaalo levels - generated and BFS-verified by tools/level_generator.py",
+        "# format: grid:minMoves:chapter:piece,piece,...",
+        "# piece:  [type][row][col][len][dir]   a=auto k=bike c=car t=thela b=bus T=truck w=cow",
+    ]
+    total = 0
+    for chapter, (name, count, lo, hi, prefer_cow) in enumerate(CHAPTERS, start=1):
+        picked = take(count, lo, hi, prefer_cow)
+        for p in picked:
+            pieces = ",".join(
+                f"{CODE[v['type']]}{v['r']}{v['c']}{v['len']}{v['dir']}" for v in p["vehicles"]
+            )
+            lines.append(f"{p['grid']}:{p['minMoves']}:{chapter}:{pieces}")
+        total += len(picked)
+        moves = [p["minMoves"] for p in picked]
+        span = f"{min(moves)}-{max(moves)}" if moves else "-"
+        print(f"Ch{chapter} {name}: {len(picked)}/{count} levels, {span} moves")
+
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    print(f"wrote {total} levels to {out_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate Nikaalo levels")
-    parser.add_argument("--count", type=int, default=40)
-    parser.add_argument("--grid", type=int, default=6)
-    parser.add_argument("--min-moves", type=int, default=4)
-    parser.add_argument("--max-moves", type=int, default=14)
-    parser.add_argument("--blockers", type=int, default=7)
-    parser.add_argument("--cow-chance", type=float, default=0.0)
-    parser.add_argument("--tries", type=int, default=20000)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--out", default="levels.json")
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    miner = sub.add_parser("mine", help="hill climb for verified boards")
+    miner.add_argument("--seconds", type=float, default=600.0)
+    miner.add_argument("--min-keep", type=int, default=10)
+    miner.add_argument("--seed", type=int, default=90210)
+    miner.add_argument("--out", default="pool.json")
+
+    builder = sub.add_parser("curate", help="lay a pool out into chapters")
+    builder.add_argument("--pool", default="pool.json")
+    builder.add_argument("--also", nargs="*", dest="extra")
+    builder.add_argument("--out", default="app/src/main/assets/levels.txt")
+
     args = parser.parse_args()
-
-    rng = random.Random(args.seed)
-    levels = []
-    seen_signatures = set()
-
-    for _ in range(args.tries):
-        if len(levels) >= args.count:
-            break
-        vehicles = random_board(args.grid, args.blockers, args.cow_chance, rng)
-        if len(vehicles) < 3:
-            continue
-        signature = json.dumps(vehicles, sort_keys=True)
-        if signature in seen_signatures:
-            continue
-        seen_signatures.add(signature)
-
-        moves = min_moves(vehicles, args.grid)
-        if moves is None or not (args.min_moves <= moves <= args.max_moves):
-            continue
-
-        levels.append({
-            "id": len(levels) + 1,
-            "grid": args.grid,
-            "minMoves": moves,
-            "chapter": 1,
-            "vehicles": vehicles,
-        })
-
-    levels.sort(key=lambda level: level["minMoves"])
-    for index, level in enumerate(levels):
-        level["id"] = index + 1
-        level["chapter"] = min(6, index // 40 + 1)
-
-    with open(args.out, "w", encoding="utf-8") as handle:
-        json.dump(levels, handle, indent=2)
-        handle.write("\n")
-
-    print(f"Wrote {len(levels)} levels to {args.out}")
-    if levels:
-        print(
-            "Difficulty range: "
-            f"{levels[0]['minMoves']} - {levels[-1]['minMoves']} moves"
-        )
+    if args.command == "mine":
+        mine(args.seconds, args.min_keep, args.seed, args.out)
+    else:
+        curate(args.pool, args.out, args.extra)
 
 
 if __name__ == "__main__":

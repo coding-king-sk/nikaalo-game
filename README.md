@@ -1,94 +1,148 @@
-# 🛺 Nikaalo — Traffic Jam Puzzle
+# Nikaalo — Traffic Jam Puzzle
 
-**Jam se apni auto nikaalo!** Ek sliding-block puzzle game (Rush Hour genre) Indian traffic flavour ke saath. Kotlin + Jetpack Compose, koi game engine nahi — APK chhota, offline chalta hai, low-end phones pe smooth.
+> Jam se apni auto nikaalo.
 
-[![Build APK & Release](https://github.com/coding-king-sk/nikaalo-game/actions/workflows/release.yml/badge.svg)](https://github.com/coding-king-sk/nikaalo-game/actions/workflows/release.yml)
+A sliding-block traffic puzzle for Android. The grid is a jammed chowk; slide the
+other vehicles out of the way and drive the yellow auto out through the gate on
+the right edge.
 
----
+Built with **Kotlin + Jetpack Compose** — no game engine, no image assets, fully
+offline.
 
-## 🎮 Gameplay
+## Download
 
-Ek grid ek jammed chowk hai. Tumhari **peeli auto** ko right edge ke exit tak pahunchana hai.
+Every push to `main` builds an APK and publishes it automatically:
+**[Releases](https://github.com/coding-king-sk/nikaalo-game/releases)**
 
-- Har vehicle sirf apni lambai ki direction me slide hota hai (horizontal wale left-right, vertical wale up-down)
-- Koi vehicle ghum nahi sakta, aur kisi ke upar se cross nahi kar sakta
-- 🐄 **Gaay hilti nahi** — permanent obstacle
-- Kam moves = zyada stars (3 stars = optimal solution)
+## Gameplay
 
-## ✨ Features
+One rule, no tutorial needed:
 
-| Feature | Status |
-|---|---|
-| Drag-to-slide board with snap-to-grid | ✅ |
-| 12 hand-crafted levels (3 chapters) | ✅ |
-| BFS solver for real hints (optimal next move) | ✅ |
-| Undo / Restart | ✅ |
-| Star rating + best-moves tracking | ✅ |
-| Progress persistence (SharedPreferences) | ✅ |
-| Level generator script (Python) | ✅ |
-| Auto-build + auto-release CI | ✅ |
-| Daily challenge, ads, IAP | 🔜 |
+- Each vehicle slides only along its own length
+- Nothing turns, nothing passes through anything
+- Gaay (cow) never moves at all
+- Auto reaches the right edge → level clear
 
-## 📦 Download
+Fewer moves means more stars. Three stars requires the **optimal** solution.
 
-Latest APK: **[Releases page](https://github.com/coding-king-sk/nikaalo-game/releases)**
+| Piece | Cells | Role |
+|---|---|---|
+| Auto (yellow) | 2 | The player, one per board |
+| Bike | 2 | Small blocker |
+| Car | 2 | Standard blocker |
+| Thela | 2 | Standard blocker |
+| Bus | 3 | Large blocker |
+| Truck | 3 | Large blocker |
+| Gaay | 1 | Immovable obstacle |
 
-Har push pe CI automatically APK build karke naya release publish karta hai.
+## Content
 
-## 🏗️ Build locally
+**120 levels across 6 chapters**, every one verified by BFS — the `minMoves`
+value in the asset is the mathematically optimal solution length, not a guess.
 
-```bash
-git clone https://github.com/coding-king-sk/nikaalo-game.git
-cd nikaalo-game
-gradle wrapper --gradle-version 8.9   # first time only
-./gradlew assembleDebug
-```
+| Chapter | Theme | Levels | Grid | Optimal moves |
+|---|---|---|---|---|
+| 1 | Gali Mohalla | 15 | 6x6 | 3–6 |
+| 2 | Sabzi Mandi | 25 | 6x6, 7x7 | 7–11 |
+| 3 | Bus Stand | 25 | 6x6, 7x7 | 12–13 |
+| 4 | Highway Toll | 20 | 6x6, 7x7 | 14–15 |
+| 5 | Gaay Chowk | 20 | 6x6, 7x7 | 16–18 |
+| 6 | Rush Hour Mumbai | 15 | 6x6, 7x7 | 19–23 |
 
-APK yahan milega: `app/build/outputs/apk/debug/app-debug.apk`
+A level is unlocked once the previous one is solved.
 
-Requirements: JDK 17, Android SDK 34.
+## Features
 
-## 🧩 Naye levels banao
+- Drag any vehicle; it snaps to the grid with a spring animation and a haptic tick
+- Vehicles are drawn with Canvas (body, cabin, windshield, wheels, headlights),
+  so they scale to any grid size without assets
+- **Hints run the real solver.** BFS finds the optimal remaining path and tells
+  you the exact next move — it is never a canned tip
+- Undo, Restart, per-level best-move tracking, star ratings
+- Animated win screen with move count against the optimum
 
-`tools/level_generator.py` random boards generate karta hai, BFS solver se minimum moves nikalta hai, aur sirf woh levels rakhta hai jo difficulty range me fit hote hain.
-
-```bash
-python3 tools/level_generator.py --count 60 --min-moves 6 --max-moves 14 --grid 6 \
-  --out app/src/main/assets/levels.json
-```
-
-Koi dependency nahi chahiye — pure standard library.
-
-## 📁 Project structure
+## Project layout
 
 ```
 app/src/main/
-  assets/levels.json                  # level data
-  java/com/codingkingsk/nikaalo/
-    MainActivity.kt                   # nav + app shell
-    game/Models.kt                    # serializable level specs
-    game/Board.kt                     # immutable board + move rules
-    game/Solver.kt                    # BFS optimal solver (hints)
-    game/LevelRepository.kt           # assets loader
-    game/Progress.kt                  # best moves, stars, unlocks
-    ui/Theme.kt                       # colors, vehicle palette
-    ui/HomeScreen.kt
-    ui/LevelSelectScreen.kt
-    ui/GameScreen.kt                  # board rendering + drag
-tools/level_generator.py              # generator + solver
-docs/GAME_DESIGN.md                   # full design doc
-.github/workflows/release.yml         # build + auto release
+  assets/levels.txt        compact level data, 120 levels under 10 KB
+  java/.../game/
+    Board.kt               immutable board, slide rules, legal move ranges
+    Solver.kt              BFS solver - powers hints and level verification
+    LevelRepository.kt     levels.txt parser
+    Progress.kt            best moves, stars, unlocks (SharedPreferences)
+    Models.kt, Chapters.kt
+  java/.../ui/
+    GameScreen.kt          board, drag gestures, animations, controls
+    VehicleArt.kt          Canvas vehicle art
+    WinOverlay.kt          animated level-complete screen
+    HomeScreen.kt, LevelSelectScreen.kt, Theme.kt, Widgets.kt
+tools/level_generator.py   level miner and chapter builder
+docs/GAME_DESIGN.md        design doc
 ```
 
-## 🗺️ Roadmap
+### Level format
 
-- [ ] 350 generated levels across 6 chapters
-- [ ] Daily challenge + streak + notification
-- [ ] Share card on win (WhatsApp)
-- [ ] Sound effects + haptics
-- [ ] AdMob rewarded hints, ₹99 remove-ads IAP
-- [ ] Release signing via CI secrets
+One level per line in `assets/levels.txt`:
 
-## 📄 License
+```
+grid:minMoves:chapter:piece,piece,piece
+```
 
-MIT — see [LICENSE](LICENSE)
+Each piece is exactly five characters — `[type][row][col][len][dir]`, where type
+is one of `a` auto, `k` bike, `c` car, `t` thela, `b` bus, `T` truck, `w` cow:
+
+```
+6:23:6:a322h,t432v,t412h,k052v,t502h,T233h,t122v,k342v,c132h,c542h,t002h,k352v,b203v
+```
+
+## Generating more levels
+
+Random placement almost never produces a hard board, so the generator hill
+climbs: it mutates one blocker at a time and keeps boards whose BFS solution
+length does not get shorter.
+
+```bash
+# mine a pool of verified boards (longer run = harder boards)
+python3 tools/level_generator.py mine --seconds 900 --out pool.json
+
+# lay the pool out into chapters and write the app asset
+python3 tools/level_generator.py curate --pool pool.json \
+    --out app/src/main/assets/levels.txt
+```
+
+Edit `CHAPTERS` in the script to change chapter sizes or difficulty bands.
+
+## Building
+
+```bash
+gradle wrapper --gradle-version 8.9   # only needed on a fresh clone
+./gradlew assembleDebug
+```
+
+The wrapper JAR is not committed, so CI provisions Gradle 8.9 directly. Opening
+the project in Android Studio also generates the wrapper for you.
+
+Requires JDK 17, compileSdk 34, minSdk 24.
+
+## Releases and signing
+
+`.github/workflows/release.yml` runs on every push to `main`, on `v*` tags, and
+on manual dispatch. It builds the APK, uploads it as a build artifact, and
+publishes a GitHub Release tagged `v1.0.<run number>` (or the pushed tag).
+
+Those APKs are **debug-signed** — installable, but not Play Store ready. For a
+release build, add a keystore as repository secrets, wire a `signingConfigs`
+block into `app/build.gradle.kts`, and switch the workflow to `assembleRelease`.
+
+## Roadmap
+
+- Daily challenge with a streak counter
+- Share card on win
+- Sound effects
+- New mechanics: one-way vehicles, oil patches, move-limit mode
+- Coin economy and rewarded hints
+
+## License
+
+MIT — see [LICENSE](LICENSE).
