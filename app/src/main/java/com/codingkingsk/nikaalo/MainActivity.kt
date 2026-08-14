@@ -5,83 +5,77 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import com.codingkingsk.nikaalo.game.LevelRepository
+import com.codingkingsk.nikaalo.game.LevelSpec
 import com.codingkingsk.nikaalo.game.Progress
+import com.codingkingsk.nikaalo.game.chapterName
 import com.codingkingsk.nikaalo.ui.GameScreen
 import com.codingkingsk.nikaalo.ui.HomeScreen
 import com.codingkingsk.nikaalo.ui.LevelSelectScreen
 import com.codingkingsk.nikaalo.ui.NikaaloTheme
 
 class MainActivity : ComponentActivity() {
-
-	override fun onCreate(savedInstanceState: Bundle?) {
-		super.onCreate(savedInstanceState)
-		val repository = LevelRepository(applicationContext)
-		val progress = Progress(applicationContext)
-		setContent {
-			NikaaloTheme {
-				NikaaloApp(repository = repository, progress = progress)
-			}
-		}
-	}
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val repository = LevelRepository(applicationContext)
+        val progress = Progress(applicationContext)
+        setContent {
+            NikaaloTheme {
+                NikaaloApp(levels = repository.levels, progress = progress)
+            }
+        }
+    }
 }
 
-private sealed interface Screen {
-	data object Home : Screen
-	data object Levels : Screen
-	data class Play(val index: Int) : Screen
+sealed interface Route {
+    data object Home : Route
+    data object Levels : Route
+    data class Game(val index: Int) : Route
 }
 
 @Composable
-private fun NikaaloApp(repository: LevelRepository, progress: Progress) {
-	val levels = repository.levels
-	var screen by remember { mutableStateOf<Screen>(Screen.Home) }
-	var revision by remember { mutableStateOf(0) }
+fun NikaaloApp(levels: List<LevelSpec>, progress: Progress) {
+    var route by remember { mutableStateOf<Route>(Route.Home) }
+    var refresh by remember { mutableIntStateOf(0) }
 
-	when (val current = screen) {
-		Screen.Home -> {
-			val solved = remember(revision) { progress.solvedCount(levels) }
-			val stars = remember(revision) { progress.totalStars(levels) }
-			HomeScreen(
-				totalLevels = levels.size,
-				solvedLevels = solved,
-				totalStars = stars,
-				onPlay = { screen = Screen.Play(progress.highestUnlockedIndex(levels)) },
-				onLevels = { screen = Screen.Levels },
-			)
-		}
+    when (val current = route) {
+        Route.Home -> HomeScreen(
+            totalLevels = levels.size,
+            solvedLevels = remember(refresh) { progress.solvedCount(levels) },
+            totalStars = remember(refresh) { progress.totalStars(levels) },
+            onPlay = { route = Route.Game(progress.highestUnlockedIndex(levels)) },
+            onLevels = { route = Route.Levels },
+        )
 
-		Screen.Levels -> LevelSelectScreen(
-			levels = levels,
-			unlockedIndex = remember(revision) { progress.highestUnlockedIndex(levels) },
-			starsFor = { level -> progress.stars(level.id, level.minMoves) },
-			onPick = { index -> screen = Screen.Play(index) },
-			onBack = { screen = Screen.Home },
-		)
+        Route.Levels -> LevelSelectScreen(
+            levels = levels,
+            unlockedIndex = remember(refresh) { progress.highestUnlockedIndex(levels) },
+            starsFor = { level -> progress.stars(level.id, level.minMoves) },
+            chapterLabel = { chapter -> chapterName(chapter) },
+            onPick = { index -> route = Route.Game(index) },
+            onBack = { route = Route.Home },
+        )
 
-		is Screen.Play -> {
-			val level = levels[current.index]
-			GameScreen(
-				level = level,
-				levelNumber = current.index + 1,
-				totalLevels = levels.size,
-				bestMoves = remember(revision, level.id) { progress.bestMoves(level.id) },
-				onSolved = { moves ->
-					progress.record(level.id, moves)
-					revision++
-				},
-				onNext = {
-					screen = if (current.index < levels.lastIndex) {
-						Screen.Play(current.index + 1)
-					} else {
-						Screen.Home
-					}
-				},
-				onBack = { screen = Screen.Home },
-			)
-		}
-	}
+        is Route.Game -> {
+            val index = current.index.coerceIn(0, levels.size - 1)
+            val level = levels[index]
+            GameScreen(
+                level = level,
+                levelNumber = index + 1,
+                totalLevels = levels.size,
+                chapterName = chapterName(level.chapter),
+                bestMoves = remember(refresh, level.id) { progress.bestMoves(level.id) },
+                onSolved = { moves ->
+                    progress.record(level.id, moves)
+                    refresh += 1
+                },
+                onNext = { route = Route.Game((index + 1).coerceAtMost(levels.size - 1)) },
+                onBack = { route = Route.Levels },
+            )
+        }
+    }
 }
